@@ -1,0 +1,198 @@
+---
+title: "PBC"
+author: "Stephen Shannon"
+date: "June 28, 2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=F, results='hide', warning=FALSE}
+library(dplyr)
+library(tidyverse)
+library(survival)
+library(survminer)
+library(glmnet)
+library(vtable)
+library(ggplot2)
+library(ggfortify)
+```
+
+```{r data, message=F, results='hide', warning=FALSE}
+  #load data
+data(pbc, package="survival")
+```
+Question 1. Assess the normality of each of the candidate variables and create a table showing the appropriate summary statistics ( e.g. mean +- sd or median and interquartile range)
+
+```{r normality assumptions, message=F, results='hide', warning=FALSE}
+  #check normality of the indepedent vars
+par(mfrow=c(2,2))
+qqnorm(pbcseq$bili, main = "Normal Q-Q Plot of Bilirubin");qqline(pbcseq$bili) #non-normal
+qqnorm(pbcseq$albumin,main = "Normal Q-Q Plot of Albumin");qqline(pbcseq$albumin) #normal
+qqnorm(pbcseq$alk.phos,main = "Normal Q-Q Plot of Alkaline Phosphate");qqline(pbcseq$alk.phos) #non-normal
+qqnorm(pbcseq$ast,main = "Normal Q-Q Plot of Aspartate Aminotransferase");qqline(pbcseq$ast) #non-normal
+qqnorm(pbcseq$platelet,main = "Normal Q-Q Plot of Platelets");qqline(pbcseq$platelet) #non-normal
+qqnorm(pbcseq$protime,main = "Normal Q-Q Plot of Protime");qqline(pbcseq$protime) #non-normal
+qqnorm(pbcseq$age,main = "Normal Q-Q Plot of Age");qqline(pbcseq$age) #normal
+qqnorm(pbcseq$chol,main = "Normal Q-Q Plot of Cholestrol");qqline(pbcseq$chol) #non-normal
+```
+Figures 1 - 8: qqplots for each continous variable in the dataset, only albumin, and age are approximately normal.
+
+Table 1. Summary statistics for each continous variable in the dataset
+```{r sumtable}
+  #table of summary statistics using vtable package for sumtable
+sumtable(pbcseq, vars = c("bili", "chol", "albumin","alk.phos", "ast", "platelet", "protime", "age"), summ =  c('notNA(x)', 'mean(x)',   'sd(x)', 'min(x)', 'pctile(x)[25]', 'median(x)',  'pctile(x)[75]', 'max(x)'), out = "return")
+```
+
+```{r wrangling, message=F, results='hide', warning=FALSE}
+
+  #glmnet requires that there are no NAs, and that the event var is only 0 or 1.
+  #Since 1s are given to liver transplant cases, we must filter those who recieved
+  #liver transplants and replace it with death, 2.
+
+  #It may be easier to remove cholestrol from the analysis as many entries
+  #are missing, and would remove all of these incomplete cases from
+  #the analysis
+
+pbcseq <- pbcseq %>% select(-chol)
+pbcseq <- pbcseq %>% drop_na() %>% filter(status != 1) 
+pbcseq["status"][pbcseq["status"] == 2] <- 1
+```
+
+
+```{r cox, message=F, warning=FALSE}
+first <- with(pbcseq, c(TRUE, diff(id) !=0))
+last <- c(first[-1], TRUE)
+
+  #setup start, stop times and outcome for coxph
+  #if first checkup, choose 0 days, otherwise choose the current day
+time1 <- with(pbcseq, ifelse(first, 1, day))
+
+  #if the last checkup, choose the follow up time, otherwise choose the previous check   
+  #up time (since first checkup is not considered)
+time2 <- with(pbcseq, ifelse(last, futime, day[-1]))
+
+  #if last checkup, choose the current status, else choose censored as the outcome
+event <- with(pbcseq, ifelse(last, status, 0))
+
+  #basic model from the data source page
+
+#m1 <- coxph(Surv(time1, time2, event) ~ age + sex + log(bili), pbcseq)
+#summary(m1)
+
+  #coxph model with every coeffecient
+  #transforming some continous variables to the natural log
+m2 <- coxph(Surv(time1, time2, event) ~ trt + age + sex + ascites + hepato + spiders + edema + stage + log(bili) + log(albumin) + log(alk.phos) + log(ast) + log(platelet) + log(protime),pbcseq)
+summary(m2)
+
+  #general survival curve
+autoplot(surv_fit(m2, data=pbcseq))
+
+  #identifies bili, albumin, edema stage, and age as statistically signifigant variables
+```
+Figure 9. General survival curve from the cox regression model
+
+```{r cox plot 1, message=F, results='hide', warning=FALSE}
+  #can add different strata to view difference between groups
+  #making a cut to view range of groups
+pbcseq$bili3 <- cut(pbcseq$bili, c(0,1,2.5,40))
+strata_m2 <- coxph(Surv(time1, time2, event) ~ trt + age + sex + ascites + hepato + spiders + edema + stage + (bili) + log(albumin) + log(alk.phos) + log(ast) + strata(bili3) + log(platelet) + log(protime),pbcseq)
+autoplot(survfit(strata_m2))
+```
+Figure 10. Survival curve with strata added for bilirubin
+
+```{r cox plot 2, message=F, results='hide', warning=FALSE}
+
+  #stratified survival curve for edema status
+strata2_m2 <- coxph(Surv(time1, time2, event) ~ trt + age + sex + ascites + hepato + spiders + strata(edema) + stage + log(bili) + log(albumin) + log(alk.phos) + log(ast) + log(platelet) + log(protime),pbcseq)
+
+
+autoplot(surv_fit(strata2_m2, data=pbcseq))
+```
+Figure 11. Survival curve with strata added for edema status
+
+Question 2. Create a standard Cox regression model for survival using each of the variables as a predictor. Then use LASSO regression to identify a parsimonious set of variables predictive of survival. Propose what you believe to be the best model for the prediction of survival.
+```{r glmnet_lasso, message=F, warning=FALSE}
+
+  #lasso with cox regression, start, stop, status triplet used
+  #cross validation method for lambda selection
+
+y <- Surv(time1, time2, event)
+x <- model.matrix(y ~ trt + sex + ascites + hepato + spiders + edema + stage + age + log(bili) + log(albumin) + log(alk.phos) + log(ast) + log(platelet) + log(protime), pbcseq)
+
+  #glmnet model will not work unless low values of lambda are specified, otherwise
+  #cv.glmnet will choose lambda > 10000 which imposes an absurdly strong penalty
+  #function, leaving no params left in the model. Thus it is necessary to choose
+  #lambda values manually
+  #inspecting the algorithm with trace.it = 2, the models are indeed converging to a single
+  #value but they are slightly off the target warm up number, triggering the 
+  #cox.fit algorithm did not converge warning
+
+m4 <- cv.glmnet(x,y, family="cox", standardize = TRUE, lambda = c(0.5, 0.1, 0.05, 0.01, 0.005, 0.004, 0.0035, 0.003, 0.0025, 0.001), alpha=1)
+coef(m4)
+
+
+
+  #from this model, the best predictors appear to be sex, ascites, edema, stage, 
+  #age, log(bili), log(albumin), log(platelet), log(protime). Of these factors,
+  #only ascites, edema, log(bili), log(albumin), and log(protime) have
+  #covariate scores greater than abs(0.1), while the other variables are still
+  #included at the optimal value of lambda, their score has little effect
+  #on the hazard ratio for a patient. Age should still be included as it
+  #despite being 0.02 as it is not log transformed and ranges from 26 to 78.
+  #comparing the two models, the penalized model with LASSO regression has
+  #4 variables with coeffecients larger than 0.1, which greatly reduces
+  #the complexity of the model. The lower model complexity can reduce potential
+  #overfitting present in the unpenalized cox regression model, 
+```
+
+```{r cv.glmnet lambda selection}
+plot(m4)
+```
+Figure 12. Partial likelihood Deviance for different lambda selections
+
+```{r glmnet survival curve, message=F, results='hide', warning=FALSE}
+  #survival curve for a subject with covariates equal to the means of each variable.
+  #glmnet is not able to produce confidence intervals
+plot(survival::survfit(m4, s = "lambda.min", x = x, y = y))
+```
+Figure 13. Survival curve generated from the L1 regularized glmnet model.
+
+Question 3. Employ a valid way to assess whether any variables may be non-linearly associated with the time to event outcome. 
+
+```{r nonlinear_associations, message=F, results='hide', warning=FALSE}
+ggcoxfunctional(Surv(time1, time2, event) ~ bili + log(bili) + sqrt(bili), data = pbcseq) #close to linear, seems to be more linear with the log transformation or the square root transformation.
+ggcoxfunctional(Surv(time1, time2, event) ~ albumin + log(albumin) + sqrt(albumin), data = pbcseq) #linear or close to linear, log form does not seem to improve the linearity
+ggcoxfunctional(Surv(time1, time2, event) ~ alk.phos + log(alk.phos) + sqrt(alk.phos), data = pbcseq) #not linear, log transformation improves linearity graetly
+ggcoxfunctional(Surv(time1, time2, event) ~ ast + log(ast) + sqrt(ast), data = pbcseq) #not linear, log transformation does not improve linearity, square root may be most linear
+ggcoxfunctional(Surv(time1, time2, event) ~ platelet + log(platelet) + sqrt(platelet), data = pbcseq) #Close to linear, log transformation does not improve linearity much
+ggcoxfunctional(Surv(time1, time2, event) ~ protime + log(protime) + sqrt(protime), data = pbcseq) #not linear, log transformation marginally helps, square root function not much different, from log, appears to have residual outliers that may be influencing the curve
+ggcoxfunctional(Surv(time1, time2, event) ~ age + log(age) + sqrt(age), data = pbcseq) #linear or close to linear, virtually no change in curve with the transformations
+
+```
+Figure 14 - 20. Plots of Martingale residuals against the continous covariates. The closer the curve is to a linear form (consistent slope, generally monotonic increase or decrease), the closer the functional form is to showing a linear association between the covariate and the hazards ratio.
+
+Question 4. Create a figure that you feel adequately displays the results of your analysis that you have found
+
+```{r important visuals 1, message=F, warning=FALSE}
+
+  #survival curve for two subjects close to the same age, one with edema and ascites and high     
+  #bilirubin, the other with low bilirubin, no edema and no ascites, the patient with 
+  #presence of edema and ascites, high bilirubin creates very strong hazard ratio
+
+x[2:3,]
+plot(survival::survfit(m4, s = "lambda.min", x = x, y = y, newx = x[2:3,]))
+```
+Figure 21. Survival curve of two patients described above, the patient with edema, ascites, and high bilirubin has a much higher hazard ratio than the patient with no edema, ascites and low bilirubin.
+```{r important visuals 2, message=F, results='hide', warning=FALSE}
+strata_m2 <- coxph(Surv(time1, time2, event) ~ strata(trt) + age + sex + ascites + hepato + spiders + edema + stage + log(bili) + log(albumin) + log(alk.phos) + log(ast) + log(platelet) + log(protime),pbcseq)
+
+  #looks as if the treatment makes little difference compared
+  #to no treatment
+
+autoplot(survfit(strata_m2))
+
+```
+Figure 22. Two survival curves based on the strata of the treatment levels. Treatment makes little to no difference compared to no treatment.
